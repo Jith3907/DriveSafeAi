@@ -64,6 +64,28 @@ config.YOLO_FRAME_INTERVAL = 1  # AsyncPhone already feeds every 3rd frame
 config.PHONE_IMGSZ = YOLO_IMAGE_SIZE
 config.YOLO_IMGSZ = YOLO_IMAGE_SIZE
 
+# ---------------------------------------------------------
+# Feature config: PERCLOS
+# ---------------------------------------------------------
+PERCLOS_WINDOW_SEC = 60.0       # rolling window length in seconds
+PERCLOS_MIN_DATA_SEC = 10.0     # show 0% until at least this much data
+PERCLOS_BLINK_MAX_SEC = 0.5     # eye-close shorter than this = blink
+PERCLOS_TIRED_THRESHOLD = 15.0  # %: below = NORMAL
+PERCLOS_FATIGUE_THRESHOLD = 30.0  # %: above = HIGH FATIGUE (else TIRED)
+
+# ---------------------------------------------------------
+# Feature config: Safety Score
+# ---------------------------------------------------------
+SCORE_DEDUCT_WARNING = 2    # points lost when a WARNING alert starts
+SCORE_DEDUCT_DANGER = 5     # points lost when a DANGER alert starts (generic)
+SCORE_DEDUCT_PHONE = 8      # extra deduction for phone-specific DANGER
+SCORE_DEDUCT_DROWSY = 6     # extra deduction for drowsy/micro-sleep
+SCORE_DEDUCT_NO_DRIVER = 5  # deduction for no-driver
+SCORE_BONUS_PER_MIN = 1     # points gained per clean minute
+SCORE_EXCELLENT = 85        # label thresholds (inclusive lower bound)
+SCORE_GOOD = 70
+SCORE_FAIR = 50
+
 # Head-turn / head-up / head-down timeline, in seconds. The alert engine reads
 # these back from config, so this is the only place to change them:
 #   turned < HEAD_TURN_WARNING_SEC         SAFE
@@ -421,6 +443,20 @@ class AlertEngine:
         self._snapshot = self._blank()
         self._last_face: float | None = None
         self._first_frame: float | None = None
+        # PERCLOS & blink tracking
+        self._perclos_samples: deque = deque()  # (timestamp, eyes_closed_bool)
+        self._blink_open: bool = True           # True = eyes open last sample
+        self._blink_close_start: float | None = None
+        self._blink_count: int = 0
+        self._blink_window_start: float = time.time()
+        self._perclos_value: float = 0.0
+        self._perclos_level: str = "NORMAL"
+        self._blinks_per_min: float = 0.0
+        # Safety Score tracking
+        self._safety_score: float = 100.0
+        self._safety_label: str = "Excellent"
+        self._clean_since: float = time.time()  # start of current clean period
+        self._active_alerts: set = set()        # keys with an active alert
 
     @staticmethod
     def _blank() -> dict:
@@ -646,6 +682,107 @@ class AlertEngine:
             "unknown_driver": unknown_driver,
         }
 
+        # ----- PERCLOS update (only while face is detected) -----
+        if face:
+            eyes_closed_bool = (ear < float(getattr(config, "EAR_THRESHOLD", 0.25)))
+            self._perclos_samples.append((now, eyes_closed_bool))
+            # drop samples older than window
+            cutoff = now - PERCLOS_WINDOW_SEC
+            while self._perclos_samples and self._perclos_samples[0][0] < cutoff:
+                self._perclos_samples.popleft()
+
+            # compute time-weighted PERCLOS
+            samples = list(self._perclos_samples)
+            window_span = (samples[-1][0] - samples[0][0]) if len(samples) > 1 else 0.0
+            if window_span >= PERCLOS_MIN_DATA_SEC:
+                closed_time = 0.0
+                for idx in range(1, len(samples)):
+                    dt = samples[idx][0] - samples[idx - 1][0]
+                    if samples[idx - 1][1]:  # previous sample had eyes closed
+                        closed_time += dt
+                self._perclos_value = (closed_time / window_span) * 100.0
+            else:
+                self._perclos_value = 0.0
+
+            if self._perclos_value >= PERCLOS_FATIGUE_THRESHOLD:
+                self._perclos_level = "HIGH FATIGUE"
+            elif self._perclos_value >= PERCLOS_TIRED_THRESHOLD:
+                self._perclos_level = "TIRED"
+            else:
+                self._perclos_level = "NORMAL"
+
+            # blink detection: transition open->closed->open where closed < 0.5s
+            if eyes_closed_bool:
+                if self._blink_open:  # just closed
+                    self._blink_close_start = now
+                    self._blink_open = False
+            else:
+                if not self._blink_open and self._blink_close_start is not None:
+                    dur = now - self._blink_close_start
+                    if dur < PERCLOS_BLINK_MAX_SEC:
+                        self._blink_count += 1
+                self._blink_open = True
+                self._blink_close_start = None
+
+            # rolling 60s blink rate
+            blink_elapsed = now - self._blink_window_start
+            if blink_elapsed >= 60.0:
+                self._blinks_per_min = self._blink_count * 60.0 / blink_elapsed
+                self._blink_count = 0
+                self._blink_window_start = now
+            elif blink_elapsed > 0:
+                self._blinks_per_min = self._blink_count * 60.0 / blink_elapsed
+
+        # ----- Safety Score update -----
+        new_alerts_started = set()
+        for key, level in alerts.items():
+            if level > self._levels.get(key, _LEVEL_NONE):
+                # alert just started or escalated
+                new_alerts_started.add(key)
+
+        for key in new_alerts_started:
+            level = alerts[key]
+            if key == "phone":
+                deduct = SCORE_DEDUCT_PHONE
+            elif key == "drowsiness":
+                deduct = SCORE_DEDUCT_DROWSY
+            elif key == "no_driver":
+                deduct = SCORE_DEDUCT_NO_DRIVER
+            elif level == _LEVEL_DANGER:
+                deduct = SCORE_DEDUCT_DANGER
+            else:
+                deduct = SCORE_DEDUCT_WARNING
+            self._safety_score = max(0.0, min(100.0, self._safety_score - deduct))
+
+        # clean-minute bonus
+        current_banner = _LEVEL_NAMES.get(banner_level, "SAFE")
+        if current_banner in ("WARNING", "DANGER"):
+            self._clean_since = now  # reset clean timer
+        else:
+            clean_minutes = int((now - self._clean_since) / 60.0)
+            bonus = clean_minutes * SCORE_BONUS_PER_MIN
+            if bonus > 0:
+                self._safety_score = max(0.0, min(100.0, self._safety_score + bonus))
+                self._clean_since = now  # consume the minutes
+
+        if self._safety_score >= SCORE_EXCELLENT:
+            self._safety_label = "Excellent"
+        elif self._safety_score >= SCORE_GOOD:
+            self._safety_label = "Good"
+        elif self._safety_score >= SCORE_FAIR:
+            self._safety_label = "Fair"
+        else:
+            self._safety_label = "Poor"
+
+        # ----- Feed the session tracker -----
+        SESSION.record_frame(
+            banner_level=current_banner,
+            alerts_started=new_alerts_started,
+            alerts=alerts,
+            perclos=self._perclos_value,
+            perclos_level=self._perclos_level,
+        )
+
         with self._lock:
             for key, level in alerts.items():
                 if level > self._levels.get(key, _LEVEL_NONE):
@@ -684,8 +821,118 @@ class AlertEngine:
                     "down_seconds": round(down_seconds, 1),
                     "face_missing": round(missing, 1),
                 },
+                # Feature 1 & 2 fields
+                "perclos": round(self._perclos_value, 1),
+                "perclos_level": self._perclos_level,
+                "blinks_per_min": round(self._blinks_per_min, 1),
+                "safety_score": round(self._safety_score, 1),
+                "safety_label": self._safety_label,
             }
 
+
+# ---------------------------------------------------------
+# Feature 2: Session tracker (created before AlertEngine)
+# ---------------------------------------------------------
+class SessionTracker:
+    """Accumulates per-session statistics for the /report endpoint.
+
+    All mutating calls come from the alert-engine update() which runs in the
+    processing thread.  Read-only calls come from Flask threads.  A single
+    lock covers both paths.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reset()
+
+    def _reset(self) -> None:
+        """Initialise / reinitialise all session state."""
+        self._start_time: float = time.time()
+        self._event_counts: dict[str, int] = {}
+        self._perclos_samples: list[float] = []   # rolling list for avg/max
+        self._danger_start: float | None = None
+        self._longest_danger: float = 0.0
+        self._reached_high_fatigue: bool = False
+
+    def reset(self) -> None:
+        with self._lock:
+            self._reset()
+
+    def record_frame(
+        self,
+        banner_level: str,
+        alerts_started: set,
+        alerts: dict,
+        perclos: float,
+        perclos_level: str,
+    ) -> None:
+        with self._lock:
+            # event counts
+            for key in alerts_started:
+                self._event_counts[key] = self._event_counts.get(key, 0) + 1
+
+            # PERCLOS stats
+            self._perclos_samples.append(perclos)
+            if len(self._perclos_samples) > 18000:  # cap at ~30 min @ 10 fps
+                self._perclos_samples.pop(0)
+            if perclos_level == "HIGH FATIGUE":
+                self._reached_high_fatigue = True
+
+            # longest DANGER episode
+            if banner_level == "DANGER":
+                if self._danger_start is None:
+                    self._danger_start = time.time()
+                else:
+                    episode = time.time() - self._danger_start
+                    if episode > self._longest_danger:
+                        self._longest_danger = episode
+            else:
+                self._danger_start = None
+
+    def report(self, safety_score: float, safety_label: str) -> dict:
+        with self._lock:
+            now = time.time()
+            duration_sec = now - self._start_time
+            perclos_list = list(self._perclos_samples)
+            avg_perclos = (sum(perclos_list) / len(perclos_list)) if perclos_list else 0.0
+            max_perclos = max(perclos_list) if perclos_list else 0.0
+            counts = dict(self._event_counts)
+            longest_danger = self._longest_danger
+            reached_high = self._reached_high_fatigue
+
+        # Build recommendation
+        drowsy_n = counts.get("drowsiness", 0)
+        phone_n = counts.get("phone", 0)
+        no_driver_n = counts.get("no_driver", 0)
+        rec_parts = []
+        if safety_score < 70 or reached_high:
+            if drowsy_n:
+                rec_parts.append(f"{drowsy_n} drowsiness event{'s' if drowsy_n != 1 else ''}")
+            if phone_n:
+                rec_parts.append(f"{phone_n} phone event{'s' if phone_n != 1 else ''}")
+            if no_driver_n:
+                rec_parts.append(f"{no_driver_n} no-driver event{'s' if no_driver_n != 1 else ''}")
+        if rec_parts:
+            recommendation = "Take a break: " + ", ".join(rec_parts) + " detected."
+        elif safety_score >= SCORE_EXCELLENT:
+            recommendation = "Great driving! Keep it up."
+        else:
+            recommendation = "Stay focused and take breaks every 2 hours."
+
+        return {
+            "session_start": datetime.fromtimestamp(self._start_time).strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_sec": round(duration_sec, 1),
+            "safety_score": round(safety_score, 1),
+            "safety_label": safety_label,
+            "event_counts": counts,
+            "avg_perclos": round(avg_perclos, 1),
+            "max_perclos": round(max_perclos, 1),
+            "longest_danger_sec": round(longest_danger, 1),
+            "recommendation": recommendation,
+        }
+
+
+SESSION = SessionTracker()
 
 ALERTS = AlertEngine()
 
@@ -1013,6 +1260,17 @@ PAGE = """<!doctype html>
   .card.off { border-left-color: #33445f; color: #7e90ad; }
   .card.warning { border-left-color: #d97706; background: #241c0a; color: #fcd34d; }
   .card.danger { border-left-color: #dc2626; background: #2a0f10; color: #fca5a5; }
+  /* Safety Score big-number card */
+  .card.score-excellent { border-left-color: #16a34a; background: #0d2618; color: #86efac; }
+  .card.score-good      { border-left-color: #0369a1; background: #0c1e32; color: #7dd3fc; }
+  .card.score-fair      { border-left-color: #b45309; background: #241c0a; color: #fcd34d; }
+  .card.score-poor      { border-left-color: #dc2626; background: #2a0f10; color: #fca5a5; }
+  .card.score-excellent strong, .card.score-good strong,
+  .card.score-fair strong, .card.score-poor strong { font-size: 28px; }
+  /* PERCLOS card */
+  .card.perclos-normal  { border-left-color: #16a34a; }
+  .card.perclos-tired   { border-left-color: #b45309; background: #241c0a; color: #fcd34d; }
+  .card.perclos-fatigue { border-left-color: #dc2626; background: #2a0f10; color: #fca5a5; }
 
   .log { margin-top: 18px; background: #0e1728; border: 1px solid #24344f; border-radius: 12px; }
   .log h2 { margin: 0; padding: 12px 14px; font-size: 12px; letter-spacing: .9px;
@@ -1029,6 +1287,12 @@ PAGE = """<!doctype html>
     box-shadow: inset 0 0 0 8px rgba(239, 68, 68, .95);
     animation: pulse .7s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .2 } }
+
+  .toplinks { font-size: 12px; color: #8ea1bd; }
+  .toplinks a { color: #7dd3fc; text-decoration: none; margin-left: 10px; }
+  .toplinks a:hover { text-decoration: underline; }
+  label.voice-label { font-size: 13px; color: #8ea1bd; display: flex;
+                      align-items: center; gap: 5px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -1039,7 +1303,13 @@ PAGE = """<!doctype html>
       <span id="camera" class="chip">camera unknown</span>
       <button id="enable" type="button">Enable sound</button>
       <button id="mute" type="button" hidden>Mute</button>
+      <label class="voice-label" id="voice-label" hidden>
+        <input type="checkbox" id="voice-check" /> Voice
+      </label>
       <span id="audio-state">sound off</span>
+    </div>
+    <div class="toplinks">
+      <a href="/report" id="report-link">Session Report</a>
     </div>
   </header>
 
@@ -1061,6 +1331,24 @@ PAGE = """<!doctype html>
   </div>
 
   <section class="cards" id="cards">
+    <!-- Feature 2: Safety Score card -->
+    <div class="card score-excellent" id="safety-card">
+      <span>Safety Score</span>
+      <strong id="safety-score">100</strong>
+      <em id="safety-label">Excellent</em>
+    </div>
+    <!-- Feature 1: PERCLOS card -->
+    <div class="card perclos-normal" id="perclos-card">
+      <span>PERCLOS</span>
+      <strong id="perclos-value">0.0%</strong>
+      <em id="perclos-level">NORMAL</em>
+    </div>
+    <!-- Feature 1: Blinks card -->
+    <div class="card off" id="blinks-card">
+      <span>Blinks / min</span>
+      <strong id="blinks-value">-</strong>
+    </div>
+    <!-- Existing alert cards -->
     <div class="card off" data-key="drowsiness"><span>Drowsy</span><strong>NO</strong></div>
     <div class="card off" data-key="yawning"><span>Yawn</span><strong>NO</strong></div>
     <div class="card off" data-key="looking_left"><span>Looking Left</span><strong>NO</strong></div>
@@ -1094,6 +1382,17 @@ PAGE = """<!doctype html>
   var muteBtn = document.getElementById("mute");
   var audioState = document.getElementById("audio-state");
   var badgeEl = document.getElementById("driver-badge");
+  var voiceLabel = document.getElementById("voice-label");
+  var voiceCheck = document.getElementById("voice-check");
+
+  // Feature 1 UI elements
+  var safetyCard = document.getElementById("safety-card");
+  var safetyScoreEl = document.getElementById("safety-score");
+  var safetyLabelEl = document.getElementById("safety-label");
+  var perclosCard = document.getElementById("perclos-card");
+  var perclosValueEl = document.getElementById("perclos-value");
+  var perclosLevelEl = document.getElementById("perclos-level");
+  var blinksValueEl = document.getElementById("blinks-value");
 
   var readout = {
     ear: document.getElementById("ear"),
@@ -1168,6 +1467,8 @@ PAGE = """<!doctype html>
     muteBtn.hidden = false;
     muteBtn.textContent = "Mute";
     muteBtn.classList.remove("on");
+    // Show the Voice checkbox now that sound is enabled
+    voiceLabel.hidden = false;
     audioLabel();
     tone("warning");
     if (state.banner === "DANGER") { startLoop(); }
@@ -1178,9 +1479,79 @@ PAGE = """<!doctype html>
     muteBtn.textContent = audio.muted ? "Unmute" : "Mute";
     muteBtn.classList.toggle("on", audio.muted);
     audioLabel();
-    if (audio.muted) { stopLoop(); }
-    else if (state.banner === "DANGER") { startLoop(); }
+    if (audio.muted) {
+      stopLoop();
+      if (window.speechSynthesis) { window.speechSynthesis.cancel(); }
+    } else if (state.banner === "DANGER") { startLoop(); }
   });
+
+  // ---------------- Feature 3: Voice alerts ----------------
+  // Per-message cooldown map: text -> timestamp of last utterance.
+  // Phone gets its own key so it can repeat every 10 s independently.
+  var voiceCooldowns = {};
+  var VOICE_COOLDOWN_MS      = 8000;   // default cooldown for all messages
+  var PHONE_COOLDOWN_MS      = 10000;  // phone repeats every 10 s while active
+  var PHONE_MSG = "You are using your phone. Please keep your phone away and focus on the road.";
+
+  function voiceEnabled() {
+    return audio.enabled && !audio.muted && voiceCheck.checked &&
+           window.speechSynthesis !== undefined;
+  }
+
+  // speak(text, cooldownMs)
+  // Fires if enough time has passed since the last time THIS exact message
+  // was spoken.  No banner-level dedupe — that was silencing repeats.
+  function speak(text, cooldownMs) {
+    if (!voiceEnabled()) { return; }
+    if (cooldownMs === undefined) { cooldownMs = VOICE_COOLDOWN_MS; }
+    var now = Date.now();
+    var last = voiceCooldowns[text] || 0;
+    if (now - last < cooldownMs) { return; }
+    window.speechSynthesis.cancel();
+    var utt = new SpeechSynthesisUtterance(text);
+    utt.rate = 1.05;
+    utt.pitch = 1.0;
+    utt.volume = 1.0;
+    window.speechSynthesis.speak(utt);
+    voiceCooldowns[text] = now;
+  }
+
+  function triggerVoiceAlert(status) {
+    var banner = status.banner || "SAFE";
+    if (banner === "SAFE") {
+      // Clear phone cooldown when phone alert ends so it fires immediately next time
+      voiceCooldowns[PHONE_MSG] = 0;
+      return;
+    }
+    var flags = status.flags || {};
+    var alerts = status.alerts || {};
+    var perclosLevel = status.perclos_level || "NORMAL";
+    var safetyScore = status.safety_score !== undefined ? status.safety_score : 100;
+
+    // Phone: highest priority, fires immediately on start and repeats every 10 s
+    // while the alert stays active (flags.phone or 'phone' in alerts).
+    if (flags.phone || ("phone" in alerts)) {
+      speak(PHONE_MSG, PHONE_COOLDOWN_MS);
+      return;  // phone takes priority over all other voice alerts
+    } else {
+      // Phone cleared — reset its cooldown so it speaks immediately if it returns
+      voiceCooldowns[PHONE_MSG] = 0;
+    }
+
+    // Very tired: HIGH FATIGUE or score below 50
+    if (perclosLevel === "HIGH FATIGUE" || safetyScore < 50) {
+      speak("You seem very tired. Please take a break.");
+      return;
+    }
+    if (flags.drowsy || ("drowsiness" in alerts)) {
+      speak("Warning. You look drowsy. Please stay alert.");
+    } else if (flags.looking_left || flags.looking_right ||
+               flags.looking_up || flags.looking_down) {
+      speak("Please keep your eyes on the road.");
+    } else if (flags.no_driver) {
+      speak("Driver not detected.");
+    }
+  }
 
   // ---------------- banner ----------------
   function applyBanner(level, message) {
@@ -1198,6 +1569,38 @@ PAGE = """<!doctype html>
       if (level === "WARNING") { tone("warning"); }
     }
     state.banner = level;
+  }
+
+  // ---------------- Feature 1 & 2: score/perclos cards ----------------
+  var SCORE_CLASS = {
+    "Excellent": "score-excellent",
+    "Good":      "score-good",
+    "Fair":      "score-fair",
+    "Poor":      "score-poor"
+  };
+  var PERCLOS_CLASS = {
+    "NORMAL":      "perclos-normal",
+    "TIRED":       "perclos-tired",
+    "HIGH FATIGUE":"perclos-fatigue"
+  };
+
+  function updateScoreCard(score, label) {
+    if (!safetyCard) { return; }
+    safetyScoreEl.textContent = Math.round(score);
+    safetyLabelEl.textContent = label;
+    var cls = SCORE_CLASS[label] || "score-fair";
+    safetyCard.className = "card " + cls;
+  }
+
+  function updatePerclosCard(perclos, level, blinks) {
+    if (!perclosCard) { return; }
+    perclosValueEl.textContent = perclos.toFixed(1) + "%";
+    perclosLevelEl.textContent = level;
+    var cls = PERCLOS_CLASS[level] || "perclos-normal";
+    perclosCard.className = "card " + cls;
+    if (blinksValueEl) {
+      blinksValueEl.textContent = isFinite(blinks) ? blinks.toFixed(1) : "-";
+    }
   }
 
   // ---------------- cards and numbers ----------------
@@ -1286,6 +1689,21 @@ PAGE = """<!doctype html>
         }
 
         renderMessages(status.messages || []);
+
+        // Feature 1 & 2 UI updates
+        if (status.safety_score !== undefined) {
+          updateScoreCard(status.safety_score, status.safety_label || "Excellent");
+        }
+        if (status.perclos !== undefined) {
+          updatePerclosCard(
+            status.perclos,
+            status.perclos_level || "NORMAL",
+            status.blinks_per_min !== undefined ? status.blinks_per_min : 0
+          );
+        }
+
+        // Feature 3: voice alerts
+        triggerVoiceAlert(status);
       })
       .catch(function () {
         cameraEl.textContent = "server unreachable";
@@ -1402,6 +1820,308 @@ def api_status():
     response = jsonify(monitor.status())
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# ---------------------------------------------------------
+# Feature 2: /api/reset  POST - reset the session
+# ---------------------------------------------------------
+@app.post("/api/reset")
+def api_reset():
+    SESSION.reset()
+    # Also reset the safety score inside AlertEngine
+    with ALERTS._lock:
+        ALERTS._safety_score = 100.0
+        ALERTS._safety_label = "Excellent"
+        ALERTS._clean_since = time.time()
+        ALERTS._perclos_samples.clear()
+        ALERTS._perclos_value = 0.0
+        ALERTS._perclos_level = "NORMAL"
+        ALERTS._blinks_per_min = 0.0
+        ALERTS._blink_count = 0
+        ALERTS._blink_window_start = time.time()
+        ALERTS._blink_open = True
+        ALERTS._blink_close_start = None
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------
+# Feature 2: /api/report  GET - JSON session report
+# ---------------------------------------------------------
+@app.get("/api/report")
+def api_report():
+    """Return session report as JSON.  Always returns valid JSON, even on a
+    brand-new session with no data: every numeric field is a finite float,
+    every string field is a non-empty string, and event_counts is a dict."""
+    try:
+        snap = ALERTS.snapshot()
+        raw_score = snap.get("safety_score", 100.0)
+        raw_label = snap.get("safety_label", "Excellent")
+        # Guard against None / NaN coming out of snapshot
+        if raw_score is None or (isinstance(raw_score, float) and raw_score != raw_score):
+            raw_score = 100.0
+        data = SESSION.report(
+            safety_score=float(raw_score),
+            safety_label=str(raw_label) if raw_label else "Excellent",
+        )
+        # Sanitise every field before sending
+        def _safe_float(v, default=0.0):
+            try:
+                f = float(v)
+                return default if f != f else f  # replace NaN
+            except (TypeError, ValueError):
+                return default
+
+        data["duration_sec"]       = _safe_float(data.get("duration_sec"), 0.0)
+        data["safety_score"]       = _safe_float(data.get("safety_score"), 100.0)
+        data["avg_perclos"]        = _safe_float(data.get("avg_perclos"), 0.0)
+        data["max_perclos"]        = _safe_float(data.get("max_perclos"), 0.0)
+        data["longest_danger_sec"] = _safe_float(data.get("longest_danger_sec"), 0.0)
+        if not data.get("session_start"):
+            data["session_start"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not data.get("safety_label"):
+            data["safety_label"] = "Excellent"
+        if not isinstance(data.get("event_counts"), dict):
+            data["event_counts"] = {}
+        if not data.get("recommendation"):
+            data["recommendation"] = "No data yet."
+    except Exception as exc:
+        # Absolute fallback so the page never hangs on "Loading..."
+        data = {
+            "session_start": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_sec": 0.0,
+            "safety_score": 100.0,
+            "safety_label": "Excellent",
+            "event_counts": {},
+            "avg_perclos": 0.0,
+            "max_perclos": 0.0,
+            "longest_danger_sec": 0.0,
+            "recommendation": f"Report error: {exc}",
+        }
+    response = jsonify(data)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# ---------------------------------------------------------
+# Feature 2: /report.csv  GET - CSV download
+# ---------------------------------------------------------
+@app.get("/report.csv")
+def report_csv():
+    snap = ALERTS.snapshot()
+    data = SESSION.report(
+        safety_score=snap.get("safety_score", 100.0),
+        safety_label=snap.get("safety_label", "Excellent"),
+    )
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["field", "value"])
+    writer.writerow(["session_start", data["session_start"]])
+    writer.writerow(["duration_sec", data["duration_sec"]])
+    writer.writerow(["safety_score", data["safety_score"]])
+    writer.writerow(["safety_label", data["safety_label"]])
+    writer.writerow(["avg_perclos_pct", data["avg_perclos"]])
+    writer.writerow(["max_perclos_pct", data["max_perclos"]])
+    writer.writerow(["longest_danger_sec", data["longest_danger_sec"]])
+    writer.writerow(["recommendation", data["recommendation"]])
+    writer.writerow([])
+    writer.writerow(["event_type", "count"])
+    for k, v in sorted(data["event_counts"].items()):
+        writer.writerow([k, v])
+    csv_bytes = buf.getvalue().encode("utf-8")
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=drivesafe_report.csv"},
+    )
+
+
+# ---------------------------------------------------------
+# Feature 2: /report  GET - HTML session report page
+# ---------------------------------------------------------
+REPORT_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DriveSafe AI - Session Report</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0a1120; color: #e6ecf7;
+         font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 28px 20px 48px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .sub { color: #8ea1bd; font-size: 13px; margin: 0 0 24px; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
+  button, a.btn { font: inherit; font-size: 13px; padding: 8px 16px;
+    border-radius: 8px; border: 1px solid #2b3d5c;
+    background: #16233a; color: #e6ecf7; cursor: pointer; text-decoration: none; }
+  button:hover, a.btn:hover { background: #1d2d49; }
+  button.danger { border-color: #b91c1c; color: #fca5a5; }
+  button.danger:hover { background: #2a0f10; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #1d2d45; }
+  th { font-size: 11px; letter-spacing: .8px; text-transform: uppercase;
+       color: #8ea1bd; background: #0e1728; }
+  tr:last-child td { border-bottom: none; }
+  td:first-child { color: #8ea1bd; width: 52%; }
+  td:last-child { font-weight: 600; }
+  .score-excellent { color: #86efac; }
+  .score-good      { color: #7dd3fc; }
+  .score-fair      { color: #fcd34d; }
+  .score-poor      { color: #fca5a5; }
+  .rec { margin-top: 20px; padding: 14px 18px; background: #111e35;
+         border: 1px solid #2b3d5c; border-radius: 10px;
+         font-size: 14px; color: #c8d9f0; }
+  .rec strong { display: block; margin-bottom: 4px; font-size: 12px;
+                letter-spacing: .8px; text-transform: uppercase; color: #8ea1bd; }
+  @media print { button, a.btn { display: none; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Session Report</h1>
+  <p class="sub" id="report-sub">Loading&#8230;</p>
+  <div class="btn-row">
+    <button type="button" onclick="window.print()">Print / Save as PDF</button>
+    <a class="btn" href="/report.csv" id="csv-link">Download CSV</a>
+    <button class="danger" type="button" id="reset-btn">Reset session</button>
+    <a class="btn" href="/">&#8592; Live Monitor</a>
+  </div>
+  <table id="report-table">
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody id="report-body"><tr><td colspan="2">Loading&#8230;</td></tr></tbody>
+  </table>
+  <div class="rec" id="rec-box" hidden>
+    <strong>Recommendation</strong>
+    <span id="rec-text"></span>
+  </div>
+</main>
+<script>
+(function () {
+  "use strict";
+  var bodyEl  = document.getElementById("report-body");
+  var sub     = document.getElementById("report-sub");
+  var recBox  = document.getElementById("rec-box");
+  var recText = document.getElementById("rec-text");
+  var retryTimer = null;
+  var refreshTimer = null;
+
+  var SCORE_CLS = {
+    "Excellent": "score-excellent",
+    "Good":      "score-good",
+    "Fair":      "score-fair",
+    "Poor":      "score-poor"
+  };
+
+  function esc(v) {
+    return String(v == null ? "" : v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function fmtDuration(sec) {
+    if (!isFinite(sec) || sec < 0) { sec = 0; }
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = Math.floor(sec % 60);
+    if (h > 0) { return h + "h " + m + "m " + s + "s"; }
+    if (m > 0) { return m + "m " + s + "s"; }
+    return s + "s";
+  }
+
+  function safeFixed(v, digits) {
+    var n = Number(v);
+    return isFinite(n) ? n.toFixed(digits) : "0." + "0".repeat(digits);
+  }
+
+  function row(label, value, cls) {
+    return "<tr><td>" + esc(label) + "</td><td" +
+      (cls ? " class=\"" + esc(cls) + "\"" : "") + ">" + esc(value) + "</td></tr>";
+  }
+
+  function scheduleRefresh() {
+    if (refreshTimer) { clearTimeout(refreshTimer); }
+    refreshTimer = setTimeout(load, 5000);
+  }
+
+  function showError(msg) {
+    sub.textContent = "Could not load report.";
+    bodyEl.innerHTML = "<tr><td colspan=\"2\" style=\"color:#fca5a5\">" +
+      esc(msg) + "</td></tr>";
+    if (retryTimer) { clearTimeout(retryTimer); }
+    retryTimer = setTimeout(load, 3000);
+  }
+
+  function load() {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+    fetch("/api/report", { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) { throw new Error("HTTP " + r.status); }
+        return r.json();
+      })
+      .then(function (d) {
+        try {
+          sub.textContent = "Session started " + (d.session_start || "-");
+          var scoreCls = SCORE_CLS[d.safety_label] || "";
+          var html = "";
+          html += row("Session start",         d.session_start || "-");
+          html += row("Duration",               fmtDuration(d.duration_sec));
+          html += row("Safety score",           Math.round(Number(d.safety_score) || 0) + " / 100", scoreCls);
+          html += row("Safety label",           d.safety_label || "-", scoreCls);
+          html += row("Avg PERCLOS",            safeFixed(d.avg_perclos, 1) + "%");
+          html += row("Max PERCLOS",            safeFixed(d.max_perclos, 1) + "%");
+          html += row("Longest DANGER episode", safeFixed(d.longest_danger_sec, 1) + " s");
+          var counts = (d.event_counts && typeof d.event_counts === "object")
+                       ? d.event_counts : {};
+          var eventKeys = Object.keys(counts).sort();
+          if (eventKeys.length === 0) {
+            html += row("Events", "None recorded");
+          } else {
+            for (var i = 0; i < eventKeys.length; i++) {
+              var k = eventKeys[i];
+              html += row("Events \u2014 " + k.replace(/_/g, " "), counts[k]);
+            }
+          }
+          bodyEl.innerHTML = html;
+          if (d.recommendation) {
+            recText.textContent = d.recommendation;
+            recBox.hidden = false;
+          } else {
+            recBox.hidden = true;
+          }
+          scheduleRefresh();
+        } catch (renderErr) {
+          showError("Render error: " + renderErr.message);
+        }
+      })
+      .catch(function (err) {
+        showError(err ? err.message || String(err) : "Network error");
+      });
+  }
+
+  document.getElementById("reset-btn").addEventListener("click", function () {
+    fetch("/api/reset", { method: "POST" })
+      .then(function (r) {
+        if (!r.ok) { throw new Error("HTTP " + r.status); }
+        return load();
+      })
+      .catch(function (err) {
+        alert("Reset failed: " + (err ? err.message : "unknown error"));
+      });
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/report")
+def report_page():
+    return Response(REPORT_PAGE, mimetype="text/html")
 
 
 def main() -> None:
