@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+
+# personal / private data
+data/known_drivers/
+data/calibration.json
+logs/
+screenshots/
+
+# model weights that download automatically
+yolov8n.pt
+runs/

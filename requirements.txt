@@ -1,0 +1,11 @@
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+ultralytics>=8.0.0
+pygame>=2.5.0
+streamlit>=1.30.0
+pandas>=2.0.0
+flask>=3.0.0
+# Optional face authentication package:
+# face_recognition requires CMake and dlib C++ compilation or pre-built dlib wheel on Windows.
+# Install if needed: pip install cmake dlib face_recognition
