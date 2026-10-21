@@ -28,6 +28,8 @@ Threads:
 from __future__ import annotations
 
 import csv
+import html
+import io
 import os
 import threading
 import time
@@ -36,7 +38,7 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 
 from src import config
 from src.ui.pipeline import process_frame
@@ -207,45 +209,96 @@ class FrameGrabber(threading.Thread):
         self._frame = None
         self._seq = 0
         self._stop = threading.Event()
+        self._active = threading.Event()
+        self._active.set()
+        self._cap = None
 
     def snapshot(self):
         with self._lock:
             return self._seq, self._frame
 
+    def stop_capture(self) -> None:
+        self._active.clear()
+        with self._lock:
+            self._frame = None
+            if self._cap is not None:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+
+    def start_capture(self) -> None:
+        self._active.set()
+
     def stop(self) -> None:
+        self._active.clear()
         self._stop.set()
+        with self._lock:
+            self._frame = None
+            if self._cap is not None:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+
+    def start(self) -> None:
+        self._active.set()
+        if not self.is_alive():
+            super().start()
 
     def run(self) -> None:
-        print(f"  [camera] searching for a webcam (preferred index {self.index})...")
-        cap, index, backend, attempts = open_camera(self.index)
-        if cap is None:
-            print("  [camera] ERROR: no camera could be opened. Tried:")
-            for line in attempts:
-                print(f"  [camera]   {line}")
-            print(
-                "  [camera] Check that the webcam is plugged in, that no other app "
-                "(Teams, Zoom, the Streamlit fallback) is using it, and that "
-                "Settings > Privacy > Camera allows desktop apps."
-            )
-            self.error = (
-                "No camera could be opened (tried "
-                + ", ".join(attempts[:6])
-                + (", ..." if len(attempts) > 6 else "")
-                + ")."
-            )
-            return
-
-        self.opened_index = index
-        self.backend = backend
         failures = 0
         try:
             while not self._stop.is_set():
-                ok, frame = cap.read()
+                if not self._active.is_set():
+                    with self._lock:
+                        if self._cap is not None:
+                            try:
+                                self._cap.release()
+                            except Exception:
+                                pass
+                            self._cap = None
+                            self._frame = None
+                    time.sleep(0.05)
+                    continue
+
+                if self._cap is None:
+                    print(f"  [camera] searching for a webcam (preferred index {self.index})...")
+                    cap, index, backend, attempts = open_camera(self.index)
+                    if cap is None:
+                        print("  [camera] ERROR: no camera could be opened. Tried:")
+                        for line in attempts:
+                            print(f"  [camera]   {line}")
+                        self.error = (
+                            "No camera could be opened (tried "
+                            + ", ".join(attempts[:6])
+                            + (", ..." if len(attempts) > 6 else "")
+                            + ")."
+                        )
+                        time.sleep(0.5)
+                        continue
+                    self.opened_index = index
+                    self.backend = backend
+                    self.error = None
+                    failures = 0
+                    with self._lock:
+                        self._cap = cap
+
+                ok, frame = self._cap.read()
                 if not ok or frame is None:
                     failures += 1
                     if failures >= MAX_READ_FAILURES:
                         self.error = "Lost the camera feed."
-                        break
+                        with self._lock:
+                            try:
+                                self._cap.release()
+                            except Exception:
+                                pass
+                            self._cap = None
+                        time.sleep(0.2)
+                        continue
                     time.sleep(0.02)
                     continue
                 failures = 0
@@ -257,10 +310,13 @@ class FrameGrabber(threading.Thread):
             self.error = f"Camera error: {exc}"
             print(f"  [camera] ERROR: {self.error}")
         finally:
-            try:
-                cap.release()
-            except Exception:
-                pass
+            with self._lock:
+                if self._cap is not None:
+                    try:
+                        self._cap.release()
+                    except Exception:
+                        pass
+                    self._cap = None
 
 
 # ---------------------------------------------------------
@@ -457,6 +513,56 @@ class AlertEngine:
         self._safety_label: str = "Excellent"
         self._clean_since: float = time.time()  # start of current clean period
         self._active_alerts: set = set()        # keys with an active alert
+
+    def clear_timers(self) -> None:
+        with self._lock:
+            now = time.time()
+            self._yaw_start = None
+            self._yaw_direction = None
+            self._up_start = None
+            self._down_start = None
+            self._last_face = now
+            self._first_frame = now
+            self._levels.clear()
+            self._perclos_samples.clear()
+            self._blink_open = True
+            self._blink_close_start = None
+            self._blink_window_start = now
+            self._clean_since = now
+            self._snapshot["banner"] = "SAFE"
+            self._snapshot["message"] = "Driver attentive - all detectors clear"
+            self._snapshot["alerts"] = {}
+            if "flags" in self._snapshot:
+                for k in self._snapshot["flags"]:
+                    self._snapshot["flags"][k] = False
+
+    def stop_monitoring(self) -> None:
+        with self._lock:
+            self._levels.clear()
+            self._snapshot["banner"] = "STOPPED"
+            self._snapshot["message"] = "MONITORING STOPPED"
+            self._snapshot["alerts"] = {}
+            if "flags" in self._snapshot:
+                for k in self._snapshot["flags"]:
+                    self._snapshot["flags"][k] = False
+
+    def reset_session(self) -> None:
+        with self._lock:
+            now = time.time()
+            self._safety_score = 100.0
+            self._safety_label = "Excellent"
+            self._clean_since = now
+            self._perclos_samples.clear()
+            self._perclos_value = 0.0
+            self._perclos_level = "NORMAL"
+            self._blinks_per_min = 0.0
+            self._blink_count = 0
+            self._blink_window_start = now
+            self._blink_open = True
+            self._blink_close_start = None
+            self._messages.clear()
+            self._levels.clear()
+            self._snapshot = self._blank()
 
     @staticmethod
     def _blank() -> dict:
@@ -837,7 +943,7 @@ class SessionTracker:
     """Accumulates per-session statistics for the /report endpoint.
 
     All mutating calls come from the alert-engine update() which runs in the
-    processing thread.  Read-only calls come from Flask threads.  A single
+    processing thread. Read-only calls come from Flask threads. A single
     lock covers both paths.
     """
 
@@ -847,7 +953,11 @@ class SessionTracker:
 
     def _reset(self) -> None:
         """Initialise / reinitialise all session state."""
-        self._start_time: float = time.time()
+        now = time.time()
+        self._start_time: float = now
+        self._stop_time: float | None = None
+        self._active_duration: float = 0.0
+        self._run_start: float | None = now
         self._event_counts: dict[str, int] = {}
         self._perclos_samples: list[float] = []   # rolling list for avg/max
         self._danger_start: float | None = None
@@ -858,6 +968,22 @@ class SessionTracker:
         with self._lock:
             self._reset()
 
+    def pause(self) -> None:
+        with self._lock:
+            now = time.time()
+            if self._run_start is not None:
+                self._active_duration += (now - self._run_start)
+                self._run_start = None
+            self._stop_time = now
+            self._danger_start = None
+
+    def resume(self) -> None:
+        with self._lock:
+            now = time.time()
+            if self._run_start is None:
+                self._run_start = now
+            self._stop_time = None
+
     def record_frame(
         self,
         banner_level: str,
@@ -867,6 +993,9 @@ class SessionTracker:
         perclos_level: str,
     ) -> None:
         with self._lock:
+            if self._run_start is None:
+                return
+
             # event counts
             for key in alerts_started:
                 self._event_counts[key] = self._event_counts.get(key, 0) + 1
@@ -889,10 +1018,21 @@ class SessionTracker:
             else:
                 self._danger_start = None
 
-    def report(self, safety_score: float, safety_label: str) -> dict:
+    def report(self, safety_score: float, safety_label: str, is_monitoring: bool = True) -> dict:
         with self._lock:
             now = time.time()
-            duration_sec = now - self._start_time
+            duration_sec = self._active_duration
+            if self._run_start is not None and is_monitoring:
+                duration_sec += (now - self._run_start)
+
+            session_start = datetime.fromtimestamp(self._start_time).strftime("%Y-%m-%d %H:%M:%S")
+            if is_monitoring and self._run_start is not None:
+                session_end = "still running"
+            elif self._stop_time is not None:
+                session_end = datetime.fromtimestamp(self._stop_time).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                session_end = "Stopped"
+
             perclos_list = list(self._perclos_samples)
             avg_perclos = (sum(perclos_list) / len(perclos_list)) if perclos_list else 0.0
             max_perclos = max(perclos_list) if perclos_list else 0.0
@@ -920,7 +1060,8 @@ class SessionTracker:
             recommendation = "Stay focused and take breaks every 2 hours."
 
         return {
-            "session_start": datetime.fromtimestamp(self._start_time).strftime("%Y-%m-%d %H:%M:%S"),
+            "session_start": session_start,
+            "session_end": session_end,
             "duration_sec": round(duration_sec, 1),
             "safety_score": round(safety_score, 1),
             "safety_label": safety_label,
@@ -942,7 +1083,8 @@ _raw_process_frame = process_frame
 def _process_frame_with_alerts(frame, runtime: dict) -> dict:
     """Runs the unchanged pipeline, then feeds its result to the alert engine."""
     result = _raw_process_frame(frame, runtime)
-    ALERTS.update(result)
+    if monitor.is_monitoring:
+        ALERTS.update(result)
     return result
 
 
@@ -1102,6 +1244,24 @@ class Monitor:
         self.camera: FrameGrabber | None = None
         self.processing: ProcessingWorker | None = None
         self.error: str | None = None
+        self.is_monitoring: bool = True
+        self._lock = threading.Lock()
+
+    def start_monitoring(self) -> None:
+        with self._lock:
+            self.is_monitoring = True
+            if self.camera is not None:
+                self.camera.start_capture()
+            ALERTS.clear_timers()
+            SESSION.resume()
+
+    def stop_monitoring(self) -> None:
+        with self._lock:
+            self.is_monitoring = False
+            if self.camera is not None:
+                self.camera.stop_capture()
+            SESSION.pause()
+            ALERTS.stop_monitoring()
 
     def start(self) -> None:
         """Starts the camera thread, then the detector + processing threads.
@@ -1127,8 +1287,6 @@ class Monitor:
             return
 
         if self.camera.snapshot()[1] is None:
-            # Not fatal: the grabber keeps trying and the stream sends the
-            # placeholder until a real frame arrives.
             print(
                 "  [startup] no camera frame yet - the page will show "
                 "'Starting camera...' until one arrives"
@@ -1159,6 +1317,8 @@ class Monitor:
         print("  [startup] processing thread running")
 
     def camera_ok(self) -> bool:
+        if not self.is_monitoring:
+            return False
         if self.camera is None or self.camera.error is not None:
             return False
         _, frame = self.camera.snapshot()
@@ -1178,12 +1338,21 @@ class Monitor:
 
         status["stream_fps"] = round(STREAM_METER.fps(), 1)
         status["camera_ok"] = camera_ok
+        status["monitoring"] = self.is_monitoring
+
+        if not self.is_monitoring:
+            status["banner"] = "STOPPED"
+            status["message"] = "MONITORING STOPPED"
+            status["alerts"] = {}
+            if "flags" in status:
+                for k in status["flags"]:
+                    status["flags"][k] = False
 
         last_error = self.error or camera_error or status.get("error")
         status["last_error"] = last_error
-        status["error"] = last_error  # the page reads this key
+        status["error"] = last_error
         if not camera_ok:
-            status["ready"] = False  # whatever was published is now stale
+            status["ready"] = False
         status["timestamp"] = clock()
         return status
 
@@ -1229,6 +1398,7 @@ PAGE = """<!doctype html>
           padding: 4px 9px; border-radius: 999px; border: 1px solid #2b3d5c; color: #8ea1bd; }
   .chip.ok { border-color: #15803d; color: #86efac; }
   .chip.bad { border-color: #b91c1c; color: #fca5a5; }
+  .chip.stopped { border-color: #475569; color: #94a3b8; }
 
   .banner { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
             padding: 18px 22px; border-radius: 14px; border: 1px solid transparent;
@@ -1238,6 +1408,7 @@ PAGE = """<!doctype html>
   .banner.safe { background: #0d2618; border-color: #15803d; color: #86efac; }
   .banner.warning { background: #2b2109; border-color: #b45309; color: #fcd34d; }
   .banner.danger { background: #2b0b0b; border-color: #b91c1c; color: #fca5a5; }
+  .banner.stopped { background: #1e293b; border-color: #475569; color: #94a3b8; }
 
   .cols { display: grid; grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
           gap: 16px; align-items: start; }
@@ -1300,6 +1471,8 @@ PAGE = """<!doctype html>
   <header class="bar">
     <h1>DriveSafe AI <small>/ live monitor</small></h1>
     <div class="sound">
+      <span id="monitor-chip" class="chip ok">MONITORING</span>
+      <button id="monitor-toggle" type="button">Stop Monitoring</button>
       <span id="camera" class="chip">camera unknown</span>
       <button id="enable" type="button">Enable sound</button>
       <button id="mute" type="button" hidden>Mute</button>
@@ -1378,6 +1551,9 @@ PAGE = """<!doctype html>
   var messagesEl = document.getElementById("messages");
   var cardsEl = document.getElementById("cards");
   var errorEl = document.getElementById("error");
+  var monitorChip = document.getElementById("monitor-chip");
+  var monitorToggle = document.getElementById("monitor-toggle");
+  var isMonitoring = true;
   var enableBtn = document.getElementById("enable");
   var muteBtn = document.getElementById("mute");
   var audioState = document.getElementById("audio-state");
@@ -1409,6 +1585,60 @@ PAGE = """<!doctype html>
   ];
 
   var state = { banner: "SAFE", messages: -1, lastMessage: "" };
+
+  function applyMonitoringState(monitoring) {
+    isMonitoring = !!monitoring;
+    if (isMonitoring) {
+      if (monitorChip) {
+        monitorChip.textContent = "MONITORING";
+        monitorChip.className = "chip ok";
+      }
+      if (monitorToggle) {
+        monitorToggle.textContent = "Stop Monitoring";
+        monitorToggle.classList.remove("on");
+      }
+    } else {
+      if (monitorChip) {
+        monitorChip.textContent = "STOPPED";
+        monitorChip.className = "chip stopped";
+      }
+      if (monitorToggle) {
+        monitorToggle.textContent = "Start Monitoring";
+        monitorToggle.classList.add("on");
+      }
+      stopLoop();
+      if (window.speechSynthesis) { window.speechSynthesis.cancel(); }
+      bannerEl.className = "banner stopped";
+      levelEl.textContent = "MONITORING STOPPED";
+      messageEl.textContent = "Monitoring is paused. Press Start Monitoring to resume.";
+      document.body.classList.remove("danger");
+    }
+  }
+
+  if (monitorToggle) {
+    monitorToggle.addEventListener("click", function () {
+      monitorToggle.disabled = true;
+      var endpoint = isMonitoring ? "/api/monitor/stop" : "/api/monitor/start";
+      fetch(endpoint, { method: "POST" })
+        .then(function (r) {
+          if (!r.ok) { throw new Error("HTTP " + r.status); }
+          return r.json();
+        })
+        .then(function (res) {
+          if (res && typeof res.monitoring === "boolean") {
+            applyMonitoringState(res.monitoring);
+          }
+        })
+        .catch(function (err) {
+          console.error("Monitor toggle failed:", err);
+        })
+        .finally(function () {
+          window.setTimeout(function () {
+            monitorToggle.disabled = false;
+          }, 1000);
+        });
+    });
+  }
 
   // ---------------- sound ----------------
   var audio = { ctx: null, enabled: false, muted: false, loop: null };
@@ -1663,6 +1893,17 @@ PAGE = """<!doctype html>
         return response.json();
       })
       .then(function (status) {
+        var monitoring = status.monitoring !== false;
+        applyMonitoringState(monitoring);
+
+        if (!monitoring) {
+          cameraEl.textContent = status.camera_ok ? "camera ok" : "camera released";
+          cameraEl.className = "chip " + (status.camera_ok ? "ok" : "stopped");
+          readout.fps.textContent = "-";
+          readout.stream.textContent = fmt(status.stream_fps, 1);
+          return;
+        }
+
         applyBanner(status.banner || "SAFE", status.message || "");
 
         var alerts = status.alerts || {};
@@ -1728,6 +1969,7 @@ monitor = Monitor(config.CAMERA_INDEX)
 
 
 _PLACEHOLDER_JPEG: bytes | None = None
+_STOPPED_PLACEHOLDER_JPEG: bytes | None = None
 
 
 def placeholder_jpeg() -> bytes:
@@ -1755,6 +1997,31 @@ def placeholder_jpeg() -> bytes:
     return _PLACEHOLDER_JPEG
 
 
+def stopped_placeholder_jpeg() -> bytes:
+    """A dark 'Monitoring stopped. Press Start.' frame, encoded once and reused."""
+    global _STOPPED_PLACEHOLDER_JPEG
+    if _STOPPED_PLACEHOLDER_JPEG is not None:
+        return _STOPPED_PLACEHOLDER_JPEG
+
+    frame = np.full((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), 16, dtype=np.uint8)
+    for text, scale, position in (
+        ("Monitoring stopped.", 0.8, 0.46),
+        ("Press Start.", 0.6, 0.58),
+    ):
+        size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0]
+        origin = ((config.FRAME_WIDTH - size[0]) // 2, int(config.FRAME_HEIGHT * position))
+        cv2.putText(
+            frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale,
+            (214, 226, 240), 2, cv2.LINE_AA,
+        )
+
+    ok, buffer = cv2.imencode(
+        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    )
+    _STOPPED_PLACEHOLDER_JPEG = buffer.tobytes() if ok else b""
+    return _STOPPED_PLACEHOLDER_JPEG
+
+
 def mjpeg_part(jpeg: bytes) -> bytes:
     """One part of a multipart/x-mixed-replace response."""
     return (
@@ -1775,13 +2042,20 @@ def mjpeg_stream():
     so this loop never blocks on MediaPipe or YOLO.
     """
     placeholder = placeholder_jpeg()
+    stopped_placeholder = stopped_placeholder_jpeg()
     last_seq = -1
     last_sent = 0.0  # forces the first yield on connect
 
     while True:
-        jpeg, seq = monitor.frame()
         now = time.time()
+        if not monitor.is_monitoring:
+            if stopped_placeholder and now - last_sent >= PLACEHOLDER_INTERVAL:
+                last_sent = now
+                yield mjpeg_part(stopped_placeholder)
+            time.sleep(0.01)
+            continue
 
+        jpeg, seq = monitor.frame()
         if jpeg is not None and seq != last_seq:
             last_seq = seq
             last_sent = now
@@ -1795,6 +2069,268 @@ def mjpeg_stream():
             yield mjpeg_part(placeholder)
 
         time.sleep(0.01)
+
+
+def format_duration(sec: float) -> str:
+    try:
+        s = int(round(float(sec)))
+    except (TypeError, ValueError):
+        s = 0
+    if s < 0:
+        s = 0
+    h = s // 3600
+    m = (s % 3600) // 60
+    secs = s % 60
+    if h > 0:
+        return f"{h}h {m}m {secs}s"
+    if m > 0:
+        return f"{m}m {secs}s"
+    return f"{secs}s"
+
+
+def read_latest_events(limit: int = 20) -> list[dict]:
+    """Read latest events from logs/events.csv. Never crashes if missing/empty."""
+    events: list[dict] = []
+    if not EVENT_LOG_PATH.exists():
+        return events
+    try:
+        with open(EVENT_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return events
+            rows = [row for row in reader if row and len(row) >= 3 and any(row)]
+            for row in reversed(rows[-limit:]):
+                t = row[0].strip() or "-"
+                ev_type = row[2].strip().replace("_", " ") or "-"
+                events.append({"time": t, "type": ev_type})
+    except Exception as exc:
+        print(f"  [report] Error reading events log: {exc}")
+    return events
+
+
+def get_report_data() -> dict:
+    snap = ALERTS.snapshot()
+    raw_score = snap.get("safety_score", 100.0)
+    raw_label = snap.get("safety_label", "Excellent")
+    if raw_score is None or (isinstance(raw_score, float) and raw_score != raw_score):
+        raw_score = 100.0
+    if not raw_label:
+        raw_label = "Excellent"
+
+    data = SESSION.report(
+        safety_score=float(raw_score),
+        safety_label=str(raw_label),
+        is_monitoring=monitor.is_monitoring,
+    )
+
+    def _safe_float(v, default=0.0):
+        try:
+            f = float(v)
+            return default if (f != f or f is None) else f
+        except (TypeError, ValueError):
+            return default
+
+    data["duration_sec"] = _safe_float(data.get("duration_sec"), 0.0)
+    data["safety_score"] = _safe_float(data.get("safety_score"), 100.0)
+    data["avg_perclos"] = _safe_float(data.get("avg_perclos"), 0.0)
+    data["max_perclos"] = _safe_float(data.get("max_perclos"), 0.0)
+    data["longest_danger_sec"] = _safe_float(data.get("longest_danger_sec"), 0.0)
+    if not data.get("session_start"):
+        data["session_start"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not data.get("session_end"):
+        data["session_end"] = "still running" if monitor.is_monitoring else "Stopped"
+    if not data.get("safety_label"):
+        data["safety_label"] = "Excellent"
+    if not isinstance(data.get("event_counts"), dict):
+        data["event_counts"] = {}
+    if not data.get("recommendation"):
+        data["recommendation"] = "Great driving! Keep it up."
+    data["monitoring"] = bool(monitor.is_monitoring)
+    data["latest_events"] = read_latest_events(20)
+    return data
+
+
+def render_report_html() -> str:
+    data = get_report_data()
+
+    def esc(v):
+        return html.escape(str(v) if v is not None else "")
+
+    label = data.get("safety_label", "Excellent")
+    score_cls = {
+        "Excellent": "score-excellent",
+        "Good": "score-good",
+        "Fair": "score-fair",
+        "Poor": "score-poor",
+    }.get(label, "score-fair")
+
+    duration_str = format_duration(data.get("duration_sec", 0.0))
+
+    # Event counts rows
+    counts = data.get("event_counts", {})
+    if isinstance(counts, dict) and counts:
+        counts_html_list = []
+        for k in sorted(counts.keys()):
+            name = k.replace("_", " ").title()
+            val = counts[k]
+            counts_html_list.append(f"<tr><td>Events &mdash; {esc(name)}</td><td>{esc(val)}</td></tr>")
+        event_counts_rows = "\n".join(counts_html_list)
+    else:
+        event_counts_rows = "<tr><td>Events</td><td>None recorded</td></tr>"
+
+    # Latest 20 events rows
+    latest = data.get("latest_events", [])
+    if latest:
+        ev_rows = []
+        for ev in latest:
+            ev_rows.append(f"<tr><td>{esc(ev.get('time', '-'))}</td><td>{esc(ev.get('type', '-'))}</td></tr>")
+        latest_events_rows = "\n".join(ev_rows)
+    else:
+        latest_events_rows = '<tr><td colspan="2" style="color:#8ea1bd">No events recorded</td></tr>'
+
+    meta_refresh = '<meta http-equiv="refresh" content="5" />' if data.get("monitoring") else ""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safety_score_int = int(round(data.get("safety_score", 100.0)))
+    avg_perclos_str = f"{data.get('avg_perclos', 0.0):.1f}%"
+    max_perclos_str = f"{data.get('max_perclos', 0.0):.1f}%"
+    longest_danger_str = f"{data.get('longest_danger_sec', 0.0):.1f} s"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DriveSafe AI - Session Report</title>
+{meta_refresh}
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; background: #0a1120; color: #e6ecf7;
+         font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }}
+  main {{ max-width: 760px; margin: 0 auto; padding: 28px 20px 48px; }}
+  h1 {{ font-size: 22px; margin: 0 0 6px; }}
+  .sub {{ color: #8ea1bd; font-size: 13px; margin: 0 0 24px; }}
+  .btn-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }}
+  button, a.btn {{ font: inherit; font-size: 13px; padding: 8px 16px;
+    border-radius: 8px; border: 1px solid #2b3d5c;
+    background: #16233a; color: #e6ecf7; cursor: pointer; text-decoration: none; }}
+  button:hover, a.btn:hover {{ background: #1d2d49; }}
+  button.danger {{ border-color: #b91c1c; color: #fca5a5; }}
+  button.danger:hover {{ background: #2a0f10; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 24px; }}
+  th, td {{ text-align: left; padding: 9px 12px; border-bottom: 1px solid #1d2d45; }}
+  th {{ font-size: 11px; letter-spacing: .8px; text-transform: uppercase;
+       color: #8ea1bd; background: #0e1728; }}
+  tr:last-child td {{ border-bottom: none; }}
+  .metric-table td:first-child {{ color: #8ea1bd; width: 52%; }}
+  .metric-table td:last-child {{ font-weight: 600; }}
+  .score-excellent {{ color: #86efac; }}
+  .score-good      {{ color: #7dd3fc; }}
+  .score-fair      {{ color: #fcd34d; }}
+  .score-poor      {{ color: #fca5a5; }}
+  .rec {{ margin-bottom: 24px; padding: 14px 18px; background: #111e35;
+         border: 1px solid #2b3d5c; border-radius: 10px;
+         font-size: 14px; color: #c8d9f0; }}
+  .rec strong {{ display: block; margin-bottom: 4px; font-size: 12px;
+                letter-spacing: .8px; text-transform: uppercase; color: #8ea1bd; }}
+  .section-title {{ font-size: 15px; margin: 24px 0 10px; color: #e6ecf7; }}
+  .events-table td {{ font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; }}
+  .print-header {{ display: none; }}
+
+  @media print {{
+    body {{ background: #ffffff !important; color: #000000 !important; }}
+    main {{ max-width: 100% !important; padding: 0 !important; }}
+    .no-print, .btn-row, button, a.btn {{ display: none !important; }}
+    .print-header {{
+      display: block !important;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #000000;
+      padding-bottom: 10px;
+    }}
+    .print-header h1 {{ color: #000000 !important; margin: 0 0 6px 0; }}
+    .print-header p {{ color: #333333 !important; margin: 0; font-size: 13px; }}
+    h1, .sub, .section-title {{ color: #000000 !important; }}
+    table {{ width: 100% !important; border-collapse: collapse !important; color: #000000 !important; }}
+    th, td {{ border-bottom: 1px solid #cccccc !important; color: #000000 !important; }}
+    th {{ background: #f0f0f0 !important; color: #000000 !important; }}
+    .metric-table td:first-child {{ color: #333333 !important; }}
+    .metric-table td:last-child {{ color: #000000 !important; }}
+    .score-excellent, .score-good, .score-fair, .score-poor {{ color: #000000 !important; font-weight: bold; }}
+    .rec {{ background: #f8f9fa !important; border: 1px solid #cccccc !important; color: #000000 !important; }}
+    .rec strong {{ color: #333333 !important; }}
+    .events-table td {{ color: #000000 !important; }}
+  }}
+</style>
+</head>
+<body>
+<main>
+  <div class="print-header">
+    <h1>DriveSafe AI - Session Report</h1>
+    <p>Generated on: {esc(now_str)}</p>
+  </div>
+  <div class="no-print">
+    <h1>Session Report</h1>
+    <p class="sub">Session started {esc(data.get("session_start", "-"))}</p>
+    <div class="btn-row">
+      <button type="button" onclick="window.print()">Print / Save as PDF</button>
+      <a class="btn" href="/report.csv" id="csv-link">Download CSV</a>
+      <button class="danger" type="button" id="reset-btn">Reset session</button>
+      <a class="btn" href="/">&#8592; Live Monitor</a>
+    </div>
+  </div>
+
+  <table class="metric-table">
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Session start</td><td>{esc(data.get("session_start", "-"))}</td></tr>
+      <tr><td>Session end</td><td>{esc(data.get("session_end", "-"))}</td></tr>
+      <tr><td>Monitoring duration (active)</td><td>{esc(duration_str)}</td></tr>
+      <tr><td>Safety score</td><td class="{score_cls}">{safety_score_int} / 100</td></tr>
+      <tr><td>Safety label</td><td class="{score_cls}">{esc(data.get("safety_label", "-"))}</td></tr>
+      <tr><td>Avg PERCLOS</td><td>{esc(avg_perclos_str)}</td></tr>
+      <tr><td>Max PERCLOS</td><td>{esc(max_perclos_str)}</td></tr>
+      <tr><td>Longest DANGER episode</td><td>{esc(longest_danger_str)}</td></tr>
+      {event_counts_rows}
+    </tbody>
+  </table>
+
+  <div class="rec">
+    <strong>Recommendation</strong>
+    <span>{esc(data.get("recommendation", "-"))}</span>
+  </div>
+
+  <h2 class="section-title">Latest Events (up to 20)</h2>
+  <table class="events-table">
+    <thead><tr><th>Time</th><th>Event Type</th></tr></thead>
+    <tbody>
+      {latest_events_rows}
+    </tbody>
+  </table>
+</main>
+<script>
+(function() {{
+  window.addEventListener("beforeprint", function () {{
+    var meta = document.querySelector('meta[http-equiv="refresh"]');
+    if (meta) {{ meta.parentNode.removeChild(meta); }}
+  }});
+
+  var resetBtn = document.getElementById("reset-btn");
+  if (resetBtn) {{
+    resetBtn.addEventListener("click", function () {{
+      fetch("/api/reset", {{ method: "POST" }})
+        .then(function (r) {{
+          if (!r.ok) {{ throw new Error("HTTP " + r.status); }}
+          window.location.reload();
+        }})
+        .catch(function (err) {{
+          alert("Reset failed: " + (err ? err.message : "unknown error"));
+        }});
+    }});
+  }}
+}})();
+</script>
+</body>
+</html>"""
 
 
 @app.get("/")
@@ -1822,112 +2358,54 @@ def api_status():
     return response
 
 
-# ---------------------------------------------------------
-# Feature 2: /api/reset  POST - reset the session
-# ---------------------------------------------------------
+@app.post("/api/monitor/start")
+def api_monitor_start():
+    monitor.start_monitoring()
+    return jsonify({"ok": True, "monitoring": True})
+
+
+@app.post("/api/monitor/stop")
+def api_monitor_stop():
+    monitor.stop_monitoring()
+    return jsonify({"ok": True, "monitoring": False})
+
+
 @app.post("/api/reset")
 def api_reset():
     SESSION.reset()
-    # Also reset the safety score inside AlertEngine
-    with ALERTS._lock:
-        ALERTS._safety_score = 100.0
-        ALERTS._safety_label = "Excellent"
-        ALERTS._clean_since = time.time()
-        ALERTS._perclos_samples.clear()
-        ALERTS._perclos_value = 0.0
-        ALERTS._perclos_level = "NORMAL"
-        ALERTS._blinks_per_min = 0.0
-        ALERTS._blink_count = 0
-        ALERTS._blink_window_start = time.time()
-        ALERTS._blink_open = True
-        ALERTS._blink_close_start = None
+    ALERTS.reset_session()
     return jsonify({"ok": True})
 
 
-# ---------------------------------------------------------
-# Feature 2: /api/report  GET - JSON session report
-# ---------------------------------------------------------
 @app.get("/api/report")
 def api_report():
-    """Return session report as JSON.  Always returns valid JSON, even on a
-    brand-new session with no data: every numeric field is a finite float,
-    every string field is a non-empty string, and event_counts is a dict."""
-    try:
-        snap = ALERTS.snapshot()
-        raw_score = snap.get("safety_score", 100.0)
-        raw_label = snap.get("safety_label", "Excellent")
-        # Guard against None / NaN coming out of snapshot
-        if raw_score is None or (isinstance(raw_score, float) and raw_score != raw_score):
-            raw_score = 100.0
-        data = SESSION.report(
-            safety_score=float(raw_score),
-            safety_label=str(raw_label) if raw_label else "Excellent",
-        )
-        # Sanitise every field before sending
-        def _safe_float(v, default=0.0):
-            try:
-                f = float(v)
-                return default if f != f else f  # replace NaN
-            except (TypeError, ValueError):
-                return default
-
-        data["duration_sec"]       = _safe_float(data.get("duration_sec"), 0.0)
-        data["safety_score"]       = _safe_float(data.get("safety_score"), 100.0)
-        data["avg_perclos"]        = _safe_float(data.get("avg_perclos"), 0.0)
-        data["max_perclos"]        = _safe_float(data.get("max_perclos"), 0.0)
-        data["longest_danger_sec"] = _safe_float(data.get("longest_danger_sec"), 0.0)
-        if not data.get("session_start"):
-            data["session_start"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if not data.get("safety_label"):
-            data["safety_label"] = "Excellent"
-        if not isinstance(data.get("event_counts"), dict):
-            data["event_counts"] = {}
-        if not data.get("recommendation"):
-            data["recommendation"] = "No data yet."
-    except Exception as exc:
-        # Absolute fallback so the page never hangs on "Loading..."
-        data = {
-            "session_start": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "duration_sec": 0.0,
-            "safety_score": 100.0,
-            "safety_label": "Excellent",
-            "event_counts": {},
-            "avg_perclos": 0.0,
-            "max_perclos": 0.0,
-            "longest_danger_sec": 0.0,
-            "recommendation": f"Report error: {exc}",
-        }
+    data = get_report_data()
     response = jsonify(data)
     response.headers["Cache-Control"] = "no-store"
     return response
 
 
-# ---------------------------------------------------------
-# Feature 2: /report.csv  GET - CSV download
-# ---------------------------------------------------------
 @app.get("/report.csv")
 def report_csv():
-    snap = ALERTS.snapshot()
-    data = SESSION.report(
-        safety_score=snap.get("safety_score", 100.0),
-        safety_label=snap.get("safety_label", "Excellent"),
-    )
-    import io
+    data = get_report_data()
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["field", "value"])
-    writer.writerow(["session_start", data["session_start"]])
-    writer.writerow(["duration_sec", data["duration_sec"]])
-    writer.writerow(["safety_score", data["safety_score"]])
-    writer.writerow(["safety_label", data["safety_label"]])
-    writer.writerow(["avg_perclos_pct", data["avg_perclos"]])
-    writer.writerow(["max_perclos_pct", data["max_perclos"]])
-    writer.writerow(["longest_danger_sec", data["longest_danger_sec"]])
-    writer.writerow(["recommendation", data["recommendation"]])
+    writer.writerow(["session_start", data.get("session_start", "-")])
+    writer.writerow(["session_end", data.get("session_end", "-")])
+    writer.writerow(["duration_sec", data.get("duration_sec", 0.0)])
+    writer.writerow(["safety_score", data.get("safety_score", 100.0)])
+    writer.writerow(["safety_label", data.get("safety_label", "Excellent")])
+    writer.writerow(["avg_perclos_pct", data.get("avg_perclos", 0.0)])
+    writer.writerow(["max_perclos_pct", data.get("max_perclos", 0.0)])
+    writer.writerow(["longest_danger_sec", data.get("longest_danger_sec", 0.0)])
+    writer.writerow(["recommendation", data.get("recommendation", "-")])
     writer.writerow([])
     writer.writerow(["event_type", "count"])
-    for k, v in sorted(data["event_counts"].items()):
-        writer.writerow([k, v])
+    counts = data.get("event_counts", {})
+    if isinstance(counts, dict):
+        for k, v in sorted(counts.items()):
+            writer.writerow([k, v])
     csv_bytes = buf.getvalue().encode("utf-8")
     return Response(
         csv_bytes,
@@ -1936,192 +2414,15 @@ def report_csv():
     )
 
 
-# ---------------------------------------------------------
-# Feature 2: /report  GET - HTML session report page
-# ---------------------------------------------------------
-REPORT_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>DriveSafe AI - Session Report</title>
-<style>
-  * { box-sizing: border-box; }
-  body { margin: 0; background: #0a1120; color: #e6ecf7;
-         font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 28px 20px 48px; }
-  h1 { font-size: 22px; margin: 0 0 6px; }
-  .sub { color: #8ea1bd; font-size: 13px; margin: 0 0 24px; }
-  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
-  button, a.btn { font: inherit; font-size: 13px; padding: 8px 16px;
-    border-radius: 8px; border: 1px solid #2b3d5c;
-    background: #16233a; color: #e6ecf7; cursor: pointer; text-decoration: none; }
-  button:hover, a.btn:hover { background: #1d2d49; }
-  button.danger { border-color: #b91c1c; color: #fca5a5; }
-  button.danger:hover { background: #2a0f10; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #1d2d45; }
-  th { font-size: 11px; letter-spacing: .8px; text-transform: uppercase;
-       color: #8ea1bd; background: #0e1728; }
-  tr:last-child td { border-bottom: none; }
-  td:first-child { color: #8ea1bd; width: 52%; }
-  td:last-child { font-weight: 600; }
-  .score-excellent { color: #86efac; }
-  .score-good      { color: #7dd3fc; }
-  .score-fair      { color: #fcd34d; }
-  .score-poor      { color: #fca5a5; }
-  .rec { margin-top: 20px; padding: 14px 18px; background: #111e35;
-         border: 1px solid #2b3d5c; border-radius: 10px;
-         font-size: 14px; color: #c8d9f0; }
-  .rec strong { display: block; margin-bottom: 4px; font-size: 12px;
-                letter-spacing: .8px; text-transform: uppercase; color: #8ea1bd; }
-  @media print { button, a.btn { display: none; } }
-</style>
-</head>
-<body>
-<main>
-  <h1>Session Report</h1>
-  <p class="sub" id="report-sub">Loading&#8230;</p>
-  <div class="btn-row">
-    <button type="button" onclick="window.print()">Print / Save as PDF</button>
-    <a class="btn" href="/report.csv" id="csv-link">Download CSV</a>
-    <button class="danger" type="button" id="reset-btn">Reset session</button>
-    <a class="btn" href="/">&#8592; Live Monitor</a>
-  </div>
-  <table id="report-table">
-    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
-    <tbody id="report-body"><tr><td colspan="2">Loading&#8230;</td></tr></tbody>
-  </table>
-  <div class="rec" id="rec-box" hidden>
-    <strong>Recommendation</strong>
-    <span id="rec-text"></span>
-  </div>
-</main>
-<script>
-(function () {
-  "use strict";
-  var bodyEl  = document.getElementById("report-body");
-  var sub     = document.getElementById("report-sub");
-  var recBox  = document.getElementById("rec-box");
-  var recText = document.getElementById("rec-text");
-  var retryTimer = null;
-  var refreshTimer = null;
-
-  var SCORE_CLS = {
-    "Excellent": "score-excellent",
-    "Good":      "score-good",
-    "Fair":      "score-fair",
-    "Poor":      "score-poor"
-  };
-
-  function esc(v) {
-    return String(v == null ? "" : v)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
-  function fmtDuration(sec) {
-    if (!isFinite(sec) || sec < 0) { sec = 0; }
-    var h = Math.floor(sec / 3600);
-    var m = Math.floor((sec % 3600) / 60);
-    var s = Math.floor(sec % 60);
-    if (h > 0) { return h + "h " + m + "m " + s + "s"; }
-    if (m > 0) { return m + "m " + s + "s"; }
-    return s + "s";
-  }
-
-  function safeFixed(v, digits) {
-    var n = Number(v);
-    return isFinite(n) ? n.toFixed(digits) : "0." + "0".repeat(digits);
-  }
-
-  function row(label, value, cls) {
-    return "<tr><td>" + esc(label) + "</td><td" +
-      (cls ? " class=\"" + esc(cls) + "\"" : "") + ">" + esc(value) + "</td></tr>";
-  }
-
-  function scheduleRefresh() {
-    if (refreshTimer) { clearTimeout(refreshTimer); }
-    refreshTimer = setTimeout(load, 5000);
-  }
-
-  function showError(msg) {
-    sub.textContent = "Could not load report.";
-    bodyEl.innerHTML = "<tr><td colspan=\"2\" style=\"color:#fca5a5\">" +
-      esc(msg) + "</td></tr>";
-    if (retryTimer) { clearTimeout(retryTimer); }
-    retryTimer = setTimeout(load, 3000);
-  }
-
-  function load() {
-    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
-    fetch("/api/report", { cache: "no-store" })
-      .then(function (r) {
-        if (!r.ok) { throw new Error("HTTP " + r.status); }
-        return r.json();
-      })
-      .then(function (d) {
-        try {
-          sub.textContent = "Session started " + (d.session_start || "-");
-          var scoreCls = SCORE_CLS[d.safety_label] || "";
-          var html = "";
-          html += row("Session start",         d.session_start || "-");
-          html += row("Duration",               fmtDuration(d.duration_sec));
-          html += row("Safety score",           Math.round(Number(d.safety_score) || 0) + " / 100", scoreCls);
-          html += row("Safety label",           d.safety_label || "-", scoreCls);
-          html += row("Avg PERCLOS",            safeFixed(d.avg_perclos, 1) + "%");
-          html += row("Max PERCLOS",            safeFixed(d.max_perclos, 1) + "%");
-          html += row("Longest DANGER episode", safeFixed(d.longest_danger_sec, 1) + " s");
-          var counts = (d.event_counts && typeof d.event_counts === "object")
-                       ? d.event_counts : {};
-          var eventKeys = Object.keys(counts).sort();
-          if (eventKeys.length === 0) {
-            html += row("Events", "None recorded");
-          } else {
-            for (var i = 0; i < eventKeys.length; i++) {
-              var k = eventKeys[i];
-              html += row("Events \u2014 " + k.replace(/_/g, " "), counts[k]);
-            }
-          }
-          bodyEl.innerHTML = html;
-          if (d.recommendation) {
-            recText.textContent = d.recommendation;
-            recBox.hidden = false;
-          } else {
-            recBox.hidden = true;
-          }
-          scheduleRefresh();
-        } catch (renderErr) {
-          showError("Render error: " + renderErr.message);
-        }
-      })
-      .catch(function (err) {
-        showError(err ? err.message || String(err) : "Network error");
-      });
-  }
-
-  document.getElementById("reset-btn").addEventListener("click", function () {
-    fetch("/api/reset", { method: "POST" })
-      .then(function (r) {
-        if (!r.ok) { throw new Error("HTTP " + r.status); }
-        return load();
-      })
-      .catch(function (err) {
-        alert("Reset failed: " + (err ? err.message : "unknown error"));
-      });
-  });
-
-  load();
-})();
-</script>
-</body>
-</html>
-"""
-
-
 @app.get("/report")
+@app.get("/report.html")
 def report_page():
-    return Response(REPORT_PAGE, mimetype="text/html")
+    html_content = render_report_html()
+    download = request.args.get("download")
+    headers = {"Cache-Control": "no-store"}
+    if download == "1" or download == "true":
+        headers["Content-Disposition"] = "attachment; filename=drivesafe_report.html"
+    return Response(html_content, mimetype="text/html", headers=headers)
 
 
 def main() -> None:
